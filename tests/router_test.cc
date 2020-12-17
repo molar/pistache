@@ -7,6 +7,7 @@
 #include "gtest/gtest.h"
 #include <algorithm>
 
+#include <pistache/common.h>
 #include <pistache/endpoint.h>
 #include <pistache/http.h>
 #include <pistache/router.h>
@@ -234,10 +235,7 @@ TEST(router_test, test_route_head_request) {
 class MyHandler {
 public:
 
-  MyHandler()
-  : count_(0)
-  {}
-  ~MyHandler() {}
+  MyHandler() = default;
 
   void handle(
     const Pistache::Rest::Request &,
@@ -250,7 +248,7 @@ public:
 
 private:
 
-  int count_;
+  int count_ = 0;
 
 };
 
@@ -279,10 +277,9 @@ TEST(router_test, test_bind_shared_ptr) {
   endpoint->shutdown();
 }
 
-class HandlerWithAuthMiddleware :public MyHandler {
+class HandlerWithAuthMiddleware : public MyHandler {
 public:
-  HandlerWithAuthMiddleware()
-  : MyHandler(), auth_count(0), auth_succ_count(0) {}
+  HandlerWithAuthMiddleware() = default;
 
   bool do_auth(Pistache::Http::Request &request, Pistache::Http::ResponseWriter &response) {
   	auth_count++;
@@ -304,11 +301,12 @@ public:
   int getSuccAuthCount() { return auth_succ_count; }
 
 private:
-  int auth_count;
-  int auth_succ_count;
+  int auth_count = 0;
+  int auth_succ_count = 0;
 };
 
 bool fill_auth_header(Pistache::Http::Request &request, Pistache::Http::ResponseWriter &response) {
+  UNUSED(response);
   auto au = Pistache::Http::Header::Authorization();
   au.setBasicUserPassword("foo", "bar");
   request.headers().add<decltype(au)>(au);
@@ -317,6 +315,7 @@ bool fill_auth_header(Pistache::Http::Request &request, Pistache::Http::Response
 
 
 bool stop_processing(Pistache::Http::Request &request, Pistache::Http::ResponseWriter &response) {
+	UNUSED(request);
 	response.send(Pistache::Http::Code::No_Content);
 	return false;
 }
@@ -372,3 +371,75 @@ TEST(router_test, test_auth_middleware) {
 	ASSERT_EQ(handler.getSuccAuthCount(), 1);
 	ASSERT_EQ(response->status, int(Pistache::Http::Code::Ok));
 }
+
+TEST(segment_tree_node_test, test_resource_sanitize) {
+    ASSERT_EQ(SegmentTreeNode::sanitizeResource("/path"), "path");
+    ASSERT_EQ(SegmentTreeNode::sanitizeResource("/path/to/bar"), "path/to/bar");
+    ASSERT_EQ(SegmentTreeNode::sanitizeResource("/path//to/bar"), "path/to/bar");
+    ASSERT_EQ(SegmentTreeNode::sanitizeResource("/path//to/bar"), "path/to/bar");
+    ASSERT_EQ(SegmentTreeNode::sanitizeResource("/path/to///////:place"), "path/to/:place");
+}
+
+namespace {
+class WaitHelper {
+public:
+  void increment() {
+    std::lock_guard<std::mutex> lock(counterLock_);
+    ++counter_;
+    cv_.notify_one();
+  }
+
+  template <typename Duration>
+  bool wait(const size_t count, const Duration timeout) {
+    std::unique_lock<std::mutex> lock(counterLock_);
+    return cv_.wait_for(lock, timeout,
+                        [this, count]() { return counter_ >= count; });
+  }
+
+private:
+  size_t counter_ = 0;
+  std::mutex counterLock_;
+  std::condition_variable cv_;
+};
+
+TEST(router_test, test_client_disconnects) {
+  Address addr(Ipv4::any(), 0);
+  auto endpoint = std::make_shared<Http::Endpoint>(addr);
+
+  auto opts = Http::Endpoint::options().threads(1).maxRequestSize(4096);
+  endpoint->init(opts);
+
+  int count_found = 0;
+  WaitHelper count_disconnect;
+
+  Rest::Router router;
+
+  Routes::Head(router, "/moogle",
+               [&count_found](const Pistache::Rest::Request &,
+                              Pistache::Http::ResponseWriter response) {
+                 count_found++;
+                 response.send(Pistache::Http::Code::Ok);
+                 return Pistache::Rest::Route::Result::Ok;
+               });
+
+  router.addDisconnectHandler(
+      [&count_disconnect](const std::shared_ptr<Tcp::Peer> &) {
+        count_disconnect.increment();
+      });
+
+  endpoint->setHandler(router.handler());
+  endpoint->serveThreaded();
+  const auto bound_port = endpoint->getPort();
+  {
+    httplib::Client client("localhost", bound_port);
+    count_found = 0;
+    client.Head("/moogle");
+    ASSERT_EQ(count_found, 1);
+  }
+
+  const bool result = count_disconnect.wait(1, std::chrono::seconds(2));
+
+  endpoint->shutdown();
+  ASSERT_EQ(result, 1);
+}
+} // namespace

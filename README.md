@@ -2,7 +2,8 @@
 
 # Pistache
 [![N|Solid](http://pistache.io/assets/images/logo.png)](https://www.github.com/oktal/pistache)
-[![Travis Build Status](https://travis-ci.org/oktal/pistache.svg?branch=master)](https://travis-ci.org/oktal/pistache)
+
+[![Build Status](https://travis-ci.org/pistacheio/pistache.svg?branch=master)](https://travis-ci.org/pistacheio/pistache)
 
 Pistache is a modern and elegant HTTP and REST framework for C++. It is entirely written in pure-C++14 and provides a clear and pleasant API.
 
@@ -29,6 +30,29 @@ Pistache was originally created by Mathieu Stefani, but he is no longer actively
 For those that prefer IRC over Slack, the rag-tag crew of maintainers idle in `#pistache` on Freenode. Please come and join us!
 
 The [Launchpad Team](https://launchpad.net/~pistache+team) administers the daily and stable Ubuntu pre-compiled packages.
+
+## Release Versioning
+
+Please update `version.txt` accordingly with each unstable or stable release.
+
+## Interface Versioning
+
+The version of the library's public interface (ABI) is not the same as the release version. The interface version is primarily associated with the _external_ interface of the library. Different platforms handle this differently, such as AIX, GNU/Linux, and Solaris.
+
+GNU Libtool abstracts each platform's idiosyncrasies away because it is more portable than using `ar(1)` or `ranlib(1)` directly. However, it is a pain to integrate with CMake so we made do without it by setting the SONAME directly.
+
+When Pistache is installed it will normally ship:
+- `libpistache-<release>.so.X.Y`: This is the actual shared-library binary file. The _X_ and _Y_ values are the major and minor interface versions respectively.
+
+- `libpistache-<release>.so.X`: This is the _soname_ soft link that points to the binary file. It is what other programs and other libraries reference internally. You should never need to directly reference this file in your build environment.
+
+- `libpistache-<release>.so`: This is the _linker name_ entry. This is also a soft link that refers to the soname with the highest major interface version. This linker name is what is referred to on the linker command line. This file is created by the installation process.
+
+- `libpistache-<release>.a`: This is the _static archive_ form of the library. Since when using a static library all of its symbols are normally resolved before runtime, an interface version in the filename is unnecessary.
+
+If your contribution has modified the interface, you may need to update the major or minor interface versions. Otherwise user applications and build environments will eventually break. This is because they will attempt to link against an incorrect version of the library -- or worse, link correctly but with undefined runtime behaviour.
+
+The major version should be incremented every time a non-backward compatible change occured in the ABI. The minor version should be incremented every time a backward compatible change occurs. This can be done by modifying `version.txt` accordingly.
 
 # Precompiled Packages
 If you have no need to modify the Pistache source, you are strongly recommended to use precompiled packages for your distribution. This will save you time.
@@ -91,16 +115,14 @@ To [use](https://autotools.io/pkgconfig/pkg_check_modules.html) with the GNU Aut
 To use with a CMake build environment, use the [FindPkgConfig](https://cmake.org/cmake/help/latest/module/FindPkgConfig.html) module. Here is an example:
 
 ```cmake
-    cmake_minimum_required(2.8 FATAL_ERROR)
+    cmake_minimum_required(3.4 FATAL_ERROR)
     project("MyPistacheProject")
-    
-    # Tell CMake to add support for pkg-config, then use it to find the library...
-    include(FindPkgConfig)
-    pkg_search_module(PISTACHE REQUIRED libpistache>=0.0.2)
-    
-    include_directories(${PISTACHE_INCLUDE_DIRS})
+
+    # Find the library.
+    find_package(Pistache 0.0.2 REQUIRED)
+
     add_executable(${PROJECT_NAME} main.cpp)
-    target_link_libraries(${PROJECT_NAME} ${PISTACHE_LIBRARIES})
+    target_link_libraries(${PROJECT_NAME} pistache_shared)
 ```
 
 ## Makefile
@@ -186,9 +208,9 @@ On Debian based distributions, `autopkgtest` implements the DEP-8 standard. To c
 $ sudo apt install autopkgtest
 ```
 
-Next create the test image, substituting `eoan` or `amd64` for other releases or architectures:
+Next create the test image, substituting `groovy` or `amd64` for other releases or architectures:
 ```
-$ autopkgtest-buildvm-ubuntu-cloud -r eoan -a amd64
+$ autopkgtest-buildvm-ubuntu-cloud -r groovy -a amd64
 ```
 
 Generate a Pistache source package in the parent directory of `pistache_source`:

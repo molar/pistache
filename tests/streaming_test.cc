@@ -12,6 +12,8 @@
 #include <queue>
 #include <thread>
 #include <vector>
+#include <string>
+#include <condition_variable>
 
 using namespace std;
 using namespace Pistache;
@@ -85,11 +87,78 @@ void dumpData(const Rest::Request & /*req*/, Http::ResponseWriter response) {
   stream.ends();
 }
 
-TEST(streaming, from_description) {
-  Address addr(Ipv4::any(), Port(0));
-  const size_t threads = 20;
+namespace {
+  struct SyncContext {
+    std::mutex m;
+    std::condition_variable cv;
+    bool flag = false;
+  };
 
-  std::shared_ptr<Http::Endpoint> endpoint;
+  using Chunks = std::vector<std::string>;
+
+  std::string chunksToString(const Chunks& chunks) {
+    std::string result;
+
+    for (const auto &chunk : chunks) {
+      result += chunk;
+    }
+
+    return result;
+  }
+}
+
+// from
+// https://stackoverflow.com/questions/6624667/can-i-use-libcurls-curlopt-writefunction-with-a-c11-lambda-expression#14720398
+typedef size_t (*CURL_WRITEFUNCTION_PTR)(void *, size_t, size_t, void *);
+auto curl_callback = [](void *ptr, size_t size, size_t nmemb,
+                        void *userdata) -> size_t {
+  auto chunks = static_cast<Chunks*>(userdata);
+  chunks->emplace_back(static_cast<char *>(ptr), size * nmemb);
+  return size * nmemb;
+};
+
+class StreamingTests : public testing::Test {
+public:
+  StreamingTests() : address(Pistache::Ipv4::any(), Pistache::Port(0)), endpoint(address), curl(curl_easy_init()) {
+  }
+
+  void SetUp() override {
+    ASSERT_NE(nullptr, curl);
+  }
+
+  void TearDown() override {
+    curl_easy_cleanup(curl);
+    endpoint.shutdown();
+  }
+
+  void Init(const std::shared_ptr<Http::Handler>& handler) {
+    auto flags = Tcp::Options::ReuseAddr;
+    auto options = Http::Endpoint::options().threads(threads).flags(flags).maxRequestSize(1024 * 1024);
+
+    endpoint.init(options);
+    endpoint.setHandler(handler);
+    endpoint.serveThreaded();
+
+    url = "http://localhost:" + std::to_string(endpoint.getPort()) + "/";
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+                     static_cast<CURL_WRITEFUNCTION_PTR>(curl_callback));
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunks);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+  }
+
+  Address address;
+  Http::Endpoint endpoint;
+
+  CURL *curl;
+  std::string url;
+  Chunks chunks;
+
+  static constexpr std::size_t threads = 20;
+};
+
+TEST_F(StreamingTests, FromDescription) {
   Rest::Description desc("Rest Description Test", "v1");
   Rest::Router router;
 
@@ -98,47 +167,74 @@ TEST(streaming, from_description) {
       .response(Http::Code::Ok, "Response to the /ready call");
 
   router.initFromDescription(desc);
+  Init(router.handler());
 
-  auto flags = Tcp::Options::ReuseAddr;
-  auto opts =
-      Http::Endpoint::options().threads(threads).flags(flags).maxRequestSize(
-          1024 * 1024);
-
-  endpoint = std::make_shared<Pistache::Http::Endpoint>(addr);
-  endpoint->init(opts);
-  endpoint->setHandler(router.handler());
-  endpoint->serveThreaded();
-
-  std::stringstream ss;
-  // from
-  // https://stackoverflow.com/questions/6624667/can-i-use-libcurls-curlopt-writefunction-with-a-c11-lambda-expression#14720398
-  typedef size_t (*CURL_WRITEFUNCTION_PTR)(void *, size_t, size_t, void *);
-
-  auto curl_callback = [](void *ptr, size_t size, size_t nmemb,
-                          void *stream) -> size_t {
-    auto ss = static_cast<std::stringstream *>(stream);
-    ss->write(static_cast<char *>(ptr), size * nmemb);
-    return size * nmemb;
-  };
-
-  const auto port = endpoint->getPort();
-  std::string url = "http://localhost:" + std::to_string(port) + "/";
-  CURLcode res = CURLE_FAILED_INIT;
-  CURL *curl = curl_easy_init();
-  if (curl) {
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-                     static_cast<CURL_WRITEFUNCTION_PTR>(curl_callback));
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ss);
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-    res = curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
-  }
-  endpoint->shutdown();
-
+  CURLcode res = curl_easy_perform(curl);
   if (res != CURLE_OK)
     std::cerr << curl_easy_strerror(res) << std::endl;
 
   ASSERT_EQ(res, CURLE_OK);
-  ASSERT_EQ(ss.str().size(), SET_REPEATS * LETTER_REPEATS * N_LETTERS);
+  ASSERT_EQ(chunksToString(chunks).size(), SET_REPEATS * LETTER_REPEATS * N_LETTERS);
+}
+
+class HelloHandler : public Http::Handler {
+public:
+  HTTP_PROTOTYPE(HelloHandler)
+
+  explicit HelloHandler(SyncContext& ctx)
+    : ctx_{ctx}
+    {}
+
+  void onRequest(const Http::Request&, Http::ResponseWriter response) override
+  {
+    std::unique_lock<std::mutex> lk(ctx_.m);
+    auto stream = response.stream(Http::Code::Ok);
+
+    stream << "Hello ";
+    stream.flush();
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    stream << "world";
+    stream.flush();
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    stream << "!";
+    stream.ends();
+
+    ctx_.flag = true;
+    lk.unlock();
+    ctx_.cv.notify_one();
+  }
+
+private:
+  SyncContext& ctx_;
+};
+
+TEST_F(StreamingTests, ChunkedStream) {
+  SyncContext ctx;
+
+  // force unbuffered
+  curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 1);
+
+  Init(std::make_shared<HelloHandler>(ctx));
+
+  std::thread thread([&]() {
+    curl_easy_perform(curl);
+  });
+
+  std::unique_lock<std::mutex> lk{ctx.m};
+  ctx.cv.wait(lk, [&ctx]{ return ctx.flag; });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+  if (thread.joinable()) {
+    thread.join();
+  }
+
+  ASSERT_EQ(chunks.size(), 3u);
+  EXPECT_EQ(chunks[0], "Hello ");
+  EXPECT_EQ(chunks[1], "world");
+  EXPECT_EQ(chunks[2], "!");
 }

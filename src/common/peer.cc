@@ -18,6 +18,8 @@
 namespace Pistache {
 namespace Tcp {
 
+std::atomic<size_t> idCounter{0};
+
 namespace {
 struct ConcretePeer : Peer {
   ConcretePeer() = default;
@@ -26,7 +28,7 @@ struct ConcretePeer : Peer {
 } // namespace
 
 Peer::Peer(Fd fd, const Address &addr, void *ssl)
-    : fd_(fd), addr(addr), ssl_(ssl) {}
+    : fd_(fd), addr(addr), ssl_(ssl), id_(idCounter++) {}
 
 Peer::~Peer() {
 #ifdef PISTACHE_USE_SSL
@@ -66,6 +68,7 @@ const std::string &Peer::hostname() {
 }
 
 void *Peer::ssl() const { return ssl_; }
+size_t Peer::getID() const { return id_; }
 
 int Peer::fd() const {
   if (fd_ == -1) {
@@ -75,30 +78,18 @@ int Peer::fd() const {
   return fd_;
 }
 
-void Peer::putData(std::string name, std::shared_ptr<Http::Parser> data) {
-  auto it = data_.find(name);
-  if (it != std::end(data_)) {
-    throw std::runtime_error("The data already exists");
-  }
-
-  data_.insert(std::make_pair(std::move(name), std::move(data)));
+void Peer::setParser(std::shared_ptr<Http::RequestParser> parser) {
+  parser_ = parser;
 }
 
-std::shared_ptr<Http::Parser> Peer::getData(std::string name) const {
-  auto data = tryGetData(std::move(name));
-  if (data == nullptr) {
-    throw std::runtime_error("The data does not exist");
+std::shared_ptr<Http::RequestParser> Peer::getParser() const { return parser_; }
+
+Http::Request &Peer::request() {
+  if (!parser_) {
+    throw std::runtime_error("The peer has no associated parser");
   }
 
-  return data;
-}
-
-std::shared_ptr<Http::Parser> Peer::tryGetData(std::string(name)) const {
-  auto it = data_.find(name);
-  if (it == std::end(data_))
-    return nullptr;
-
-  return it->second;
+  return parser_->request;
 }
 
 Async::Promise<ssize_t> Peer::send(const RawBuffer &buffer, int flags) {
